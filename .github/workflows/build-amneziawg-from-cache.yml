@@ -23,93 +23,80 @@ on:
         type: string
         required: true
         default: "filogic"
-      openwrt_vermagic:
-        description: "OpenWrt vermagic"
-        type: string
+      compile_kmod:
+        description: "Compile kernel module inplementation"
+        type: boolean
         required: true
-        default: "any"
+        default: true
+      compile_go:
+        description: "Compile Go implementation"
+        type: boolean
+        required: true
+        default: true
 
 jobs:
-  build:
-    name: "Build AmneziaWG for OpenWrt: ${{ matrix.build_env.tag }} - ${{ matrix.build_env.pkgarch }} :: ${{ matrix.build_env.target }}/${{ matrix.build_env.subtarget }}"
+  build-amneziawg:
+    name: "Build AmneziaWG for OpenWrt: ${{ inputs.openwrt_version }} - ${{ inputs.openwrt_arch }} - ${{ inputs.openwrt_target }}/${{ inputs.openwrt_subtarget }}"
     runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        build_env:
-          - tag: ${{ inputs.openwrt_version }}
-            pkgarch: ${{ inputs.openwrt_arch }}
-            target: ${{ inputs.openwrt_target }}
-            subtarget: ${{ inputs.openwrt_subtarget }}
-            vermagic: ${{ inputs.openwrt_vermagic }}
-
-    env:
-      OPENWRT_RELEASE: ${{ matrix.build_env.tag }}
-      OPENWRT_ARCH: ${{ matrix.build_env.pkgarch }}
-      OPENWRT_TARGET: ${{ matrix.build_env.target }}
-      OPENWRT_SUBTARGET: ${{ matrix.build_env.subtarget }}
-      OPENWRT_VERMAGIC: ${{ matrix.build_env.vermagic }}
-
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '>=1.24.4'
+    - name: Checkout OpenWrt repository
+      uses: actions/checkout@v5
+      with:
+        path: openwrt
+        repository: openwrt/openwrt
+        ref: ${{ inputs.openwrt_version == 'SNAPSHOT' && 'master' || format('v{0}', inputs.openwrt_version) }}
+        fetch-depth: 0
 
-      - name: Checkout amneziawg-openwrt
-        uses: actions/checkout@v4
-        with:
-          path: amneziawg-openwrt
-          fetch-depth: 0
+    - name: Restore cached tools and kernel
+      uses: actions/cache/restore@v4
+      with:
+        key: ${{ runner.os }}-openwrt-cache-toolchain-kernel-${{ inputs.openwrt_version }}-${{ inputs.openwrt_arch }}-${{ inputs.openwrt_target }}-${{ inputs.openwrt_subtarget }}
+        fail-on-cache-miss: true
+        path: |
+          openwrt/.config
+          openwrt/.config.old
+          openwrt/feeds.conf.default
+          openwrt/bin/**
+          openwrt/build_dir/**
+          openwrt/dl/**
+          openwrt/feeds/**
+          openwrt/package/**
+          openwrt/staging_dir/**
+          openwrt/tmp/**
 
-      - name: Checkout OpenWrt snapshot repository
-        uses: actions/checkout@v4
-        if: ${{ matrix.build_env.tag == 'SNAPSHOT' }}
-        with:
-          path: openwrt
-          repository: openwrt/openwrt
-          fetch-depth: 0
-      
-      - name: Checkout OpenWrt regular repository
-        uses: actions/checkout@v4
-        if: ${{ matrix.build_env.tag != 'SNAPSHOT' }}
-        with:
-          path: openwrt
-          repository: openwrt/openwrt
-          ref: v${{ matrix.build_env.tag }}
-          fetch-depth: 0
+    - name: Compile AmneziaWG packages
+      env:
+        compile_kmod: ${{ inputs.compile_kmod }}
+        compile_go: ${{ inputs.compile_go }}
+      run: |
+        set -e -x
+        cd openwrt
+        if [ "${{ env.compile_kmod }}" = "true" ]; then
+          make package/kmod-amneziawg/{clean,download,prepare,compile} -j $(nproc)
+        fi
+        if [ "${{ env.compile_go }}" = "true" ]; then
+          make package/amneziawg-go/{clean,download,prepare,compile} -j $(nproc)
+        fi
+        make package/luci-proto-amneziawg/{clean,download,prepare,compile} -j $(nproc)
+        make package/amneziawg-tools/{clean,download,prepare,compile} -j $(nproc)
 
-      - name: Restore cached tools and kernel
-        id: cache-tools-kernel-restore
-        uses: actions/cache/restore@v4
-        with:
-          fail-on-cache-miss: true
-          key: ${{ runner.os }}-openwrt-cache-toolchain-kernel-${{ matrix.build_env.tag }}-${{ matrix.build_env.pkgarch }}-${{ matrix.build_env.target }}-${{ matrix.build_env.subtarget }}
-          restore-keys: |
-            ${{ runner.os }}-openwrt-cache-tools-kernel-${{ matrix.build_env.pkgarch }}-
-          path: |
-            openwrt/.config
-            openwrt/.config.old
-            openwrt/feeds.conf
-            openwrt/bin/**
-            openwrt/build_dir/**
-            openwrt/dl/**
-            openwrt/feeds/**
-            openwrt/package/**
-            openwrt/staging_dir/**
-            openwrt/tmp/**
+    - name: Prepare artifacts
+      env:
+        compile_kmod: ${{ inputs.compile_kmod }}
+      run: |
+        set -e -x
+        mkdir awgrelease
+        echo "vermagic=$(cat openwrt/build_dir/target-${{ inputs.openwrt_arch }}*/linux-${{ inputs.openwrt_target }}_${{ inputs.openwrt_subtarget }}/linux-*/.vermagic)" > awgrelease/vermagic
+        if [ "${{ env.compile_kmod }}" = "true" ]; then
+          find "openwrt/bin/targets/${{ inputs.openwrt_target }}/${{ inputs.openwrt_subtarget }}/packages" -maxdepth 1 -type f -name 'kmod-amneziawg*' -exec cp {} awgrelease \;
+        fi
+        find "openwrt/bin/packages/${{ inputs.openwrt_arch }}/awgopenwrt" -maxdepth 1 -type f \( -name '*.ipk' -o -name '*.apk' \) -exec cp {} awgrelease \;
 
-      - name: Build AmneziaWG
-        id: build-amneziawg
-        run: |
-          set -x
-          cd amneziawg-openwrt
-          make show-env
-          make export-env >> $GITHUB_OUTPUT
-          time -p make build-amneziawg
-          make prepare-artifacts
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: amneziawg-${{ matrix.build_env.tag }}_${{ matrix.build_env.pkgarch}}_${{ matrix.build_env.target}}_${{ matrix.build_env.subtarget}}_${{ steps.build-amneziawg.outputs.final_vermagic }}
-          path: awgrelease/*
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: amneziawg-${{ inputs.openwrt_version }}_${{ inputs.openwrt_arch }}_${{ inputs.openwrt_target }}_${{ inputs.openwrt_subtarget }}
+        path: awgrelease/*
